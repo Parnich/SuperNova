@@ -1,3 +1,4 @@
+use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind},
     execute,
@@ -259,6 +260,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 let my_public = PublicKey::from(&my_secret);
                                                 let peer_pub_obj = PublicKey::from(peer_public);
                                                 let shared_secret = my_secret.diffie_hellman(&peer_pub_obj);
+                                                let secret_bytes = shared_secret.as_bytes().to_vec();
+                                                let secret_for_read = secret_bytes.clone();
 
                                                 let mut resp_buf = [0u8; 512];
                                                 resp_buf[0] = 3;
@@ -283,13 +286,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         my_name: my_name.clone(),
                                                         peer_addr: p_addr,
                                                         peer_name: p_name,
-                                                        shared_secret: SecureBuffer { data: shared_secret.as_bytes().to_vec() },
+                                                        shared_secret: SecureBuffer { data: secret_bytes },
                                                         tx: net_send_tx,
                                                     };
                                                     chat_history.push("[System]: Key exchange complete. Secure channel established.".to_string());
 
                                                     let (mut reader, mut writer) = stream.into_split();
                                                     tokio::spawn(async move {
+                                                        let cipher = ChaCha20Poly1305::new_from_slice(&secret_for_read).unwrap();
                                                         let mut read_buf = [0u8; 512];
                                                         loop {
                                                             tokio::select! {
@@ -298,9 +302,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                         Ok(_) => {
                                                                             if read_buf[0] == 1 {
                                                                                 let len = u16::from_be_bytes([read_buf[1], read_buf[2]]) as usize;
-                                                                                if len <= 509 {
-                                                                                    if let Ok(msg) = String::from_utf8(read_buf[3..3+len].to_vec()) {
-                                                                                        let _ = main_tx.send(AppEvent::NetworkMessage(msg)).await;
+                                                                                if len >= 12 && len <= 509 {
+                                                                                    let nonce_bytes = &read_buf[3..15];
+                                                                                    let ciphertext = &read_buf[15..3+len];
+                                                                                    let nonce = Nonce::from_slice(nonce_bytes);
+                                                                                    if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+                                                                                        if let Ok(msg) = String::from_utf8(plaintext) {
+                                                                                            let _ = main_tx.send(AppEvent::NetworkMessage(msg)).await;
+                                                                                        }
                                                                                     }
                                                                                 }
                                                                             }
@@ -345,7 +354,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx } => {
-                                            let _ = tx.send(input_text.as_bytes().to_vec()).await;
+                                            let mut nonce_bytes = [0u8; 12];
+                                            rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                                            let nonce = Nonce::from_slice(&nonce_bytes);
+                                            let cipher = ChaCha20Poly1305::new_from_slice(&shared_secret.data).unwrap();
+                                            let plain_bytes = input_text.as_bytes();
+                                            let safe_len = plain_bytes.len().min(481);
+                                            if let Ok(ciphertext) = cipher.encrypt(nonce, &plain_bytes[..safe_len]) {
+                                                let mut payload = nonce_bytes.to_vec();
+                                                payload.extend(ciphertext);
+                                                let _ = tx.send(payload).await;
+                                            }
                                             chat_history.push(format!("[You]: {}", input_text));
                                             input_text.clear();
                                             app_state = AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx };
@@ -387,6 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let AppState::Listening { my_name } = current_state {
                         let (net_send_tx, mut net_send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
                         let main_tx = event_tx.clone();
+                        let secret_for_read = secret_bytes.clone();
 
                         app_state = AppState::Connected {
                             my_name: my_name.clone(),
@@ -399,6 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let (mut reader, mut writer) = stream.into_split();
                         tokio::spawn(async move {
+                            let cipher = ChaCha20Poly1305::new_from_slice(&secret_for_read).unwrap();
                             let mut read_buf = [0u8; 512];
                             loop {
                                 tokio::select! {
@@ -407,9 +428,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             Ok(_) => {
                                                 if read_buf[0] == 1 {
                                                     let len = u16::from_be_bytes([read_buf[1], read_buf[2]]) as usize;
-                                                    if len <= 509 {
-                                                        if let Ok(msg) = String::from_utf8(read_buf[3..3+len].to_vec()) {
-                                                            let _ = main_tx.send(AppEvent::NetworkMessage(msg)).await;
+                                                    if len >= 12 && len <= 509 {
+                                                        let nonce_bytes = &read_buf[3..15];
+                                                        let ciphertext = &read_buf[15..3+len];
+                                                        let nonce = Nonce::from_slice(nonce_bytes);
+                                                        if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+                                                            if let Ok(msg) = String::from_utf8(plaintext) {
+                                                                let _ = main_tx.send(AppEvent::NetworkMessage(msg)).await;
+                                                            }
                                                         }
                                                     }
                                                 }
