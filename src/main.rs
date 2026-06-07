@@ -23,8 +23,18 @@ struct SecureBuffer {
 }
 
 enum AppState {
-    Listening,
+    InputName,
+    Listening {
+        my_name: String,
+    },
+    IncomingRequest {
+        my_name: String,
+        peer_addr: SocketAddr,
+        peer_name: String,
+        stream: tokio::net::TcpStream,
+    },
     Connected {
+        my_name: String,
         peer_addr: SocketAddr,
         peer_name: String,
         tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -33,7 +43,8 @@ enum AppState {
 
 enum AppEvent {
     Terminal(KeyEvent),
-    NetworkNewConnection(tokio::net::TcpStream, SocketAddr),
+    NetworkIncomingAuth(tokio::net::TcpStream, SocketAddr, String),
+    HandshakeSuccess(tokio::net::TcpStream, SocketAddr, String),
     NetworkMessage(String),
     NetworkDisconnected,
     Error(String),
@@ -47,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app_state = AppState::Listening;
+    let mut app_state = AppState::InputName;
     let mut input_text = String::new();
     let mut chat_history: Vec<String> = vec![];
 
@@ -60,8 +71,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, addr)) => {
-                    let _ = net_tx.send(AppEvent::NetworkNewConnection(stream, addr)).await;
+                Ok((mut stream, addr)) => {
+                    let incoming_tx = net_tx.clone();
+                    tokio::spawn(async move {
+                        let mut req_buf = [0u8; 512];
+                        if stream.read_exact(&mut req_buf).await.is_ok() {
+                            if req_buf[0] == 2 {
+                                let len = u16::from_be_bytes([req_buf[1], req_buf[2]]) as usize;
+                                if len <= 509 {
+                                    if let Ok(name) = String::from_utf8(req_buf[3..3+len].to_vec()) {
+                                        let _ = incoming_tx.send(AppEvent::NetworkIncomingAuth(stream, addr, name)).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        drop(stream);
+                    });
                 }
                 Err(e) => {
                     let _ = net_tx.send(AppEvent::Error(e.to_string())).await;
@@ -93,10 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ])
                 .split(size);
 
-            let remaining_width = size.width as usize;
             let mut header_string = "── SuperNova ──".to_string();
-            if header_string.len() < remaining_width {
-                let dashes = "─".repeat(remaining_width - header_string.len());
+            if header_string.len() < size.width as usize {
+                let dashes = "─".repeat(size.width as usize - header_string.len());
                 header_string.push_str(&dashes);
             }
 
@@ -105,7 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             f.render_widget(header, chunks[0]);
 
             let status_string = match &app_state {
-                AppState::Listening => "Listening for incoming connections on port 9099...".to_string(),
+                AppState::InputName => "Set your identity before entering the grid...".to_string(),
+                AppState::Listening { my_name } => format!("Listening on port 9099 as @{}", my_name),
+                AppState::IncomingRequest { peer_name, peer_addr, .. } => format!("Authorization request from @{} ({})", peer_name, peer_addr),
                 AppState::Connected { peer_name, peer_addr, .. } => format!("Connected with @{} ({})", peer_name, peer_addr),
             };
             let status = Paragraph::new(status_string)
@@ -118,7 +145,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .wrap(Wrap { trim: true });
             f.render_widget(chat_box, chunks[2]);
 
-            let input_display = format!("> {}", input_text);
+            let input_prefix = match &app_state {
+                AppState::InputName => "Enter Nickname: ",
+                AppState::IncomingRequest { .. } => "Accept connection? (yes/no): ",
+                _ => "> ",
+            };
+            let input_display = format!("{}{}", input_prefix, input_text);
             let input_box = Paragraph::new(input_display)
                 .style(Style::default().fg(Color::Green));
             f.render_widget(input_box, chunks[3]);
@@ -143,36 +175,156 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             KeyCode::Enter => {
                                 if !input_text.is_empty() {
-                                    if input_text.starts_with("/connect ") {
-                                        let addr_str = input_text.trim_start_matches("/connect ").to_string();
-                                        chat_history.push(format!("[System]: Connecting to {}...", addr_str));
-                                        input_text.clear();
-                                        let connect_tx = event_tx.clone();
-                                        tokio::spawn(async move {
-                                            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                                                match tokio::net::TcpStream::connect(addr).await {
-                                                    Ok(stream) => {
-                                                        let _ = connect_tx.send(AppEvent::NetworkNewConnection(stream, addr)).await;
+                                    let current_state = std::mem::replace(&mut app_state, AppState::InputName);
+                                    match current_state {
+                                        AppState::InputName => {
+                                            let name = input_text.trim().to_string();
+                                            chat_history.push(format!("[System]: Identity secured as @{}.", name));
+                                            app_state = AppState::Listening { my_name: name };
+                                            input_text.clear();
+                                        }
+                                        AppState::Listening { my_name } => {
+                                            if input_text.starts_with("/connect ") {
+                                                let addr_str = input_text.trim_start_matches("/connect ").to_string();
+                                                chat_history.push(format!("[System]: Sending transmission request to {}...", addr_str));
+                                                input_text.clear();
+                                                let connect_tx = event_tx.clone();
+                                                let my_name_clone = my_name.clone();
+                                                tokio::spawn(async move {
+                                                    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                                                        match tokio::net::TcpStream::connect(addr).await {
+                                                            Ok(mut stream) => {
+                                                                let mut req_buf = [0u8; 512];
+                                                                req_buf[0] = 2;
+                                                                let name_bytes = my_name_clone.as_bytes();
+                                                                let len = name_bytes.len().min(509);
+                                                                let len_bytes = (len as u16).to_be_bytes();
+                                                                req_buf[1] = len_bytes[0];
+                                                                req_buf[2] = len_bytes[1];
+                                                                req_buf[3..3+len].copy_from_slice(&name_bytes[..len]);
+                                                                rand::thread_rng().fill_bytes(&mut req_buf[3+len..]);
+
+                                                                if stream.write_all(&req_buf).await.is_ok() {
+                                                                    let mut resp_buf = [0u8; 512];
+                                                                    if stream.read_exact(&mut resp_buf).await.is_ok() {
+                                                                        if resp_buf[0] == 3 && resp_buf[3] == 1 {
+                                                                            let p_len = u16::from_be_bytes([resp_buf[1], resp_buf[2]]) as usize;
+                                                                            if p_len > 1 && p_len <= 509 {
+                                                                                if let Ok(p_name) = String::from_utf8(resp_buf[4..3+p_len].to_vec()) {
+                                                                                    let _ = connect_tx.send(AppEvent::HandshakeSuccess(stream, addr, p_name)).await;
+                                                                                    return;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                let _ = connect_tx.send(AppEvent::Error("Connection rejected or handshake failed".to_string())).await;
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = connect_tx.send(AppEvent::Error(e.to_string())).await;
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let _ = connect_tx.send(AppEvent::Error("Invalid address format".to_string())).await;
                                                     }
-                                                    Err(e) => {
-                                                        let _ = connect_tx.send(AppEvent::Error(e.to_string())).await;
-                                                    }
+                                                });
+                                                app_state = AppState::Listening { my_name };
+                                            } else {
+                                                chat_history.push("[System]: Use /connect <ip>:<port> to link with a peer.".to_string());
+                                                input_text.clear();
+                                                app_state = AppState::Listening { my_name };
+                                            }
+                                        }
+                                        AppState::IncomingRequest { my_name, peer_addr, peer_name, mut stream } => {
+                                            let answer = input_text.trim().to_lowercase();
+                                            input_text.clear();
+                                            if answer == "yes" {
+                                                let mut resp_buf = [0u8; 512];
+                                                resp_buf[0] = 3;
+                                                let name_bytes = my_name.as_bytes();
+                                                let len = (name_bytes.len() + 1).min(509);
+                                                let len_bytes = (len as u16).to_be_bytes();
+                                                resp_buf[1] = len_bytes[0];
+                                                resp_buf[2] = len_bytes[1];
+                                                resp_buf[3] = 1;
+                                                resp_buf[4..4+name_bytes.len()].copy_from_slice(name_bytes);
+                                                rand::thread_rng().fill_bytes(&mut resp_buf[4+name_bytes.len()..]);
+
+                                                if stream.write_all(&resp_buf).await.is_ok() {
+                                                    let (net_send_tx, mut net_send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+                                                    let main_tx = event_tx.clone();
+                                                    let p_name = peer_name.clone();
+                                                    let p_addr = peer_addr;
+
+                                                    app_state = AppState::Connected {
+                                                        my_name: my_name.clone(),
+                                                        peer_addr: p_addr,
+                                                        peer_name: p_name,
+                                                        tx: net_send_tx,
+                                                    };
+                                                    chat_history.push("[System]: Secure channel established.".to_string());
+
+                                                    let (mut reader, mut writer) = stream.into_split();
+                                                    tokio::spawn(async move {
+                                                        let mut read_buf = [0u8; 512];
+                                                        loop {
+                                                            tokio::select! {
+                                                                res = reader.read_exact(&mut read_buf) => {
+                                                                    match res {
+                                                                        Ok(_) => {
+                                                                            if read_buf[0] == 1 {
+                                                                                let len = u16::from_be_bytes([read_buf[1], read_buf[2]]) as usize;
+                                                                                if len <= 509 {
+                                                                                    if let Ok(msg) = String::from_utf8(read_buf[3..3+len].to_vec()) {
+                                                                                        let _ = main_tx.send(AppEvent::NetworkMessage(msg)).await;
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        Err(_) => {
+                                                                            let _ = main_tx.send(AppEvent::NetworkDisconnected).await;
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Some(msg_bytes) = net_send_rx.recv() => {
+                                                                    let mut write_buf = [0u8; 512];
+                                                                    write_buf[0] = 1;
+                                                                    let len = msg_bytes.len().min(509);
+                                                                    let len_bytes = (len as u16).to_be_bytes();
+                                                                    write_buf[1] = len_bytes[0];
+                                                                    write_buf[2] = len_bytes[1];
+                                                                    write_buf[3..3+len].copy_from_slice(&msg_bytes[..len]);
+                                                                    rand::thread_rng().fill_bytes(&mut write_buf[3+len..]);
+                                                                    if writer.write_all(&write_buf).await.is_err() {
+                                                                        let _ = main_tx.send(AppEvent::NetworkDisconnected).await;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    });
+                                                } else {
+                                                    chat_history.push("[System]: Failed to send confirmation.".to_string());
+                                                    app_state = AppState::Listening { my_name };
                                                 }
                                             } else {
-                                                let _ = connect_tx.send(AppEvent::Error("Invalid address format".to_string())).await;
+                                                let mut resp_buf = [0u8; 512];
+                                                resp_buf[0] = 3;
+                                                resp_buf[3] = 0;
+                                                let mut s = stream;
+                                                tokio::spawn(async move {
+                                                    let _ = s.write_all(&resp_buf).await;
+                                                });
+                                                chat_history.push("[System]: Connection declined.".to_string());
+                                                app_state = AppState::Listening { my_name };
                                             }
-                                        });
-                                    } else {
-                                        match &app_state {
-                                            AppState::Connected { tx, .. } => {
-                                                let _ = tx.send(input_text.as_bytes().to_vec()).await;
-                                                chat_history.push(format!("[You]: {}", input_text));
-                                                input_text.clear();
-                                            }
-                                            AppState::Listening => {
-                                                chat_history.push("[System]: Not connected. Use /connect <ip>:<port>".to_string());
-                                                input_text.clear();
-                                            }
+                                        }
+                                        AppState::Connected { my_name, peer_addr, peer_name, tx } => {
+                                            let _ = tx.send(input_text.as_bytes().to_vec()).await;
+                                            chat_history.push(format!("[You]: {}", input_text));
+                                            input_text.clear();
+                                            app_state = AppState::Connected { my_name, peer_addr, peer_name, tx };
                                         }
                                     }
                                 }
@@ -181,76 +333,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                AppEvent::NetworkNewConnection(stream, addr) => {
-                    match app_state {
-                        AppState::Listening => {
-                            let (net_send_tx, mut net_send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
-                            let main_tx = event_tx.clone();
-
-                            app_state = AppState::Connected {
+                AppEvent::NetworkIncomingAuth(stream, addr, peer_name) => {
+                    let current_state = std::mem::replace(&mut app_state, AppState::InputName);
+                    match current_state {
+                        AppState::Listening { my_name } => {
+                            chat_history.push(format!("[System]: @{} wants to link up. Respond with 'yes' or 'no'.", peer_name));
+                            app_state = AppState::IncomingRequest {
+                                my_name,
                                 peer_addr: addr,
-                                peer_name: "Peer".to_string(),
-                                tx: net_send_tx,
+                                peer_name,
+                                stream,
                             };
-                            chat_history.push(format!("[System]: Successfully connected with [{}].", addr));
-
-                            let (mut reader, mut writer) = stream.into_split();
+                        }
+                        other => {
+                            let mut resp_buf = [0u8; 512];
+                            resp_buf[0] = 3;
+                            resp_buf[3] = 0;
+                            let mut s = stream;
                             tokio::spawn(async move {
-                                let mut read_buf = [0u8; 512];
-                                loop {
-                                    tokio::select! {
-                                        res = reader.read_exact(&mut read_buf) => {
-                                            match res {
-                                                Ok(_) => {
-                                                    let packet_type = read_buf[0];
-                                                    if packet_type == 1 {
-                                                        let len = u16::from_be_bytes([read_buf[1], read_buf[2]]) as usize;
-                                                        if len <= 509 {
-                                                            if let Ok(msg) = String::from_utf8(read_buf[3..3+len].to_vec()) {
-                                                                let _ = main_tx.send(AppEvent::NetworkMessage(msg)).await;
-                                                            }
+                                let _ = s.write_all(&resp_buf).await;
+                            });
+                            app_state = other;
+                        }
+                    }
+                }
+                AppEvent::HandshakeSuccess(stream, addr, peer_name) => {
+                    let current_state = std::mem::replace(&mut app_state, AppState::InputName);
+                    if let AppState::Listening { my_name } = current_state {
+                        let (net_send_tx, mut net_send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+                        let main_tx = event_tx.clone();
+
+                        app_state = AppState::Connected {
+                            my_name: my_name.clone(),
+                            peer_addr: addr,
+                            peer_name: peer_name.clone(),
+                            tx: net_send_tx,
+                        };
+                        chat_history.push(format!("[System]: Connection authorized by @{}.", peer_name));
+
+                        let (mut reader, mut writer) = stream.into_split();
+                        tokio::spawn(async move {
+                            let mut read_buf = [0u8; 512];
+                            loop {
+                                tokio::select! {
+                                    res = reader.read_exact(&mut read_buf) => {
+                                        match res {
+                                            Ok(_) => {
+                                                if read_buf[0] == 1 {
+                                                    let len = u16::from_be_bytes([read_buf[1], read_buf[2]]) as usize;
+                                                    if len <= 509 {
+                                                        if let Ok(msg) = String::from_utf8(read_buf[3..3+len].to_vec()) {
+                                                            let _ = main_tx.send(AppEvent::NetworkMessage(msg)).await;
                                                         }
                                                     }
                                                 }
-                                                Err(_) => {
-                                                    let _ = main_tx.send(AppEvent::NetworkDisconnected).await;
-                                                    break;
-                                                }
                                             }
-                                        }
-                                        Some(msg_bytes) = net_send_rx.recv() => {
-                                            let mut write_buf = [0u8; 512];
-                                            write_buf[0] = 1;
-                                            let len = msg_bytes.len().min(509);
-                                            let len_bytes = (len as u16).to_be_bytes();
-                                            write_buf[1] = len_bytes[0];
-                                            write_buf[2] = len_bytes[1];
-                                            write_buf[3..3+len].copy_from_slice(&msg_bytes[..len]);
-                                            rand::thread_rng().fill_bytes(&mut write_buf[3+len..]);
-                                            if writer.write_all(&write_buf).await.is_err() {
+                                            Err(_) => {
                                                 let _ = main_tx.send(AppEvent::NetworkDisconnected).await;
                                                 break;
                                             }
                                         }
                                     }
+                                    Some(msg_bytes) = net_send_rx.recv() => {
+                                        let mut write_buf = [0u8; 512];
+                                        write_buf[0] = 1;
+                                        let len = msg_bytes.len().min(509);
+                                        let len_bytes = (len as u16).to_be_bytes();
+                                        write_buf[1] = len_bytes[0];
+                                        write_buf[2] = len_bytes[1];
+                                        write_buf[3..3+len].copy_from_slice(&msg_bytes[..len]);
+                                        rand::thread_rng().fill_bytes(&mut write_buf[3+len..]);
+                                        if writer.write_all(&write_buf).await.is_err() {
+                                            let _ = main_tx.send(AppEvent::NetworkDisconnected).await;
+                                            break;
+                                        }
+                                    }
                                 }
-                            });
-                        }
-                        AppState::Connected { .. } => {
-                            drop(stream);
-                        }
+                            }
+                        });
+                    } else {
+                        app_state = current_state;
                     }
                 }
                 AppEvent::NetworkMessage(msg) => {
-                    let name = match &app_state {
-                        AppState::Connected { peer_name, .. } => peer_name.clone(),
-                        _ => "Peer".to_string(),
-                    };
-                    chat_history.push(format!("[{}]: {}", name, msg));
+                    if let AppState::Connected { peer_name, .. } = &app_state {
+                        chat_history.push(format!("[{}]: {}", peer_name, msg));
+                    }
                 }
                 AppEvent::NetworkDisconnected => {
-                    chat_history.push("[System]: Connection closed by peer.".to_string());
-                    app_state = AppState::Listening;
+                    let current_state = std::mem::replace(&mut app_state, AppState::InputName);
+                    match current_state {
+                        AppState::Connected { my_name, .. } | AppState::IncomingRequest { my_name, .. } => {
+                            chat_history.push("[System]: Connection closed by peer.".to_string());
+                            app_state = AppState::Listening { my_name };
+                        }
+                        other => {
+                            app_state = other;
+                        }
+                    }
                 }
                 AppEvent::Error(err) => {
                     chat_history.push(format!("[Error]: {}", err));
