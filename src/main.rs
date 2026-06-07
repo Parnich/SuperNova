@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app_state = AppState::InputName;
     let mut input_text = String::new();
     let mut chat_history: Vec<String> = vec![];
+    let mut scroll_offset = 0u16;
 
     let listener = TcpListener::bind("0.0.0.0:9099").await?;
 
@@ -140,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AppState::InputName => "Set your identity before entering the grid...".to_string(),
                 AppState::Listening { my_name } => format!("Listening on port 9099 as @{}", my_name),
                 AppState::IncomingRequest { peer_name, peer_addr, .. } => format!("Authorization request from @{} ({})", peer_name, peer_addr),
-                AppState::Connected { peer_name, peer_addr, .. } => format!("Secured link with @{} ({})", peer_name, peer_addr),
+                AppState::Connected { peer_name, peer_addr, .. } => format!("Secured link with @{} ({}) | [Scroll Active]", peer_name, peer_addr),
             };
             let status = Paragraph::new(status_string)
                 .style(Style::default().fg(Color::Green));
@@ -149,7 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let history_content = chat_history.join("\n");
             let chat_box = Paragraph::new(history_content)
                 .style(Style::default().fg(Color::Green))
-                .wrap(Wrap { trim: true });
+                .wrap(Wrap { trim: true })
+                .scroll((scroll_offset, 0));
             f.render_widget(chat_box, chunks[2]);
 
             let input_prefix = match &app_state {
@@ -174,6 +176,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         match key.code {
+                            KeyCode::Up => {
+                                scroll_offset = scroll_offset.saturating_add(1);
+                            }
+                            KeyCode::Down => {
+                                scroll_offset = scroll_offset.saturating_sub(1);
+                            }
+                            KeyCode::PageUp => {
+                                scroll_offset = scroll_offset.saturating_add(10);
+                            }
+                            KeyCode::PageDown => {
+                                scroll_offset = scroll_offset.saturating_sub(10);
+                            }
                             KeyCode::Char(c) => {
                                 input_text.push(c);
                             }
@@ -187,6 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         AppState::InputName => {
                                             let name = input_text.trim().to_string();
                                             chat_history.push(format!("[System]: Identity secured as @{}.", name));
+                                            scroll_offset = 0;
                                             app_state = AppState::Listening { my_name: name };
                                             input_text.clear();
                                         }
@@ -194,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             if input_text.starts_with("/connect ") {
                                                 let addr_str = input_text.trim_start_matches("/connect ").to_string();
                                                 chat_history.push(format!("[System]: Sending transmission request to {}...", addr_str));
+                                                scroll_offset = 0;
                                                 input_text.clear();
                                                 let connect_tx = event_tx.clone();
                                                 let my_name_clone = my_name.clone();
@@ -248,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 app_state = AppState::Listening { my_name };
                                             } else {
                                                 chat_history.push("[System]: Use /connect <ip>:<port> to link with a peer.".to_string());
+                                                scroll_offset = 0;
                                                 input_text.clear();
                                                 app_state = AppState::Listening { my_name };
                                             }
@@ -290,6 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         tx: net_send_tx,
                                                     };
                                                     chat_history.push("[System]: Key exchange complete. Secure channel established.".to_string());
+                                                    scroll_offset = 0;
 
                                                     let (mut reader, mut writer) = stream.into_split();
                                                     tokio::spawn(async move {
@@ -339,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     });
                                                 } else {
                                                     chat_history.push("[System]: Failed to send confirmation.".to_string());
+                                                    scroll_offset = 0;
                                                     app_state = AppState::Listening { my_name };
                                                 }
                                             } else {
@@ -350,24 +369,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let _ = s.write_all(&resp_buf).await;
                                                 });
                                                 chat_history.push("[System]: Connection declined.".to_string());
+                                                scroll_offset = 0;
                                                 app_state = AppState::Listening { my_name };
                                             }
                                         }
                                         AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx } => {
-                                            let mut nonce_bytes = [0u8; 12];
-                                            rand::thread_rng().fill_bytes(&mut nonce_bytes);
-                                            let nonce = Nonce::from_slice(&nonce_bytes);
-                                            let cipher = ChaCha20Poly1305::new_from_slice(&shared_secret.data).unwrap();
-                                            let plain_bytes = input_text.as_bytes();
-                                            let safe_len = plain_bytes.len().min(481);
-                                            if let Ok(ciphertext) = cipher.encrypt(nonce, &plain_bytes[..safe_len]) {
-                                                let mut payload = nonce_bytes.to_vec();
-                                                payload.extend(ciphertext);
-                                                let _ = tx.send(payload).await;
+                                            if input_text.trim() == "/status" {
+                                                let secret_hex: String = shared_secret.data.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+                                                chat_history.push("[System - Cryptographic Parameters]:".to_string());
+                                                chat_history.push("  - Key Exchange: X25519 Ephemeral Curve".to_string());
+                                                chat_history.push("  - Cipher Spec: ChaCha20-Poly1305 (AEAD Mode)".to_string());
+                                                chat_history.push(format!("  - Shared Secret Fragment: {}...", secret_hex));
+                                                chat_history.push(format!("  - Integrity Verification: Poly1305 MAC active"));
+                                                scroll_offset = 0;
+                                                input_text.clear();
+                                                app_state = AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx };
+                                            } else {
+                                                let mut nonce_bytes = [0u8; 12];
+                                                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                                                let nonce = Nonce::from_slice(&nonce_bytes);
+                                                let cipher = ChaCha20Poly1305::new_from_slice(&shared_secret.data).unwrap();
+                                                let plain_bytes = input_text.as_bytes();
+                                                let safe_len = plain_bytes.len().min(481);
+                                                if let Ok(ciphertext) = cipher.encrypt(nonce, &plain_bytes[..safe_len]) {
+                                                    let mut payload = nonce_bytes.to_vec();
+                                                    payload.extend(ciphertext);
+                                                    let _ = tx.send(payload).await;
+                                                }
+                                                chat_history.push(format!("[You]: {}", input_text));
+                                                scroll_offset = 0;
+                                                input_text.clear();
+                                                app_state = AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx };
                                             }
-                                            chat_history.push(format!("[You]: {}", input_text));
-                                            input_text.clear();
-                                            app_state = AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx };
                                         }
                                     }
                                 }
@@ -381,6 +414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match current_state {
                         AppState::Listening { my_name } => {
                             chat_history.push(format!("[System]: @{} wants to link up. Respond with 'yes' or 'no'.", peer_name));
+                            scroll_offset = 0;
                             app_state = AppState::IncomingRequest {
                                 my_name,
                                 peer_addr: addr,
@@ -416,6 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tx: net_send_tx,
                         };
                         chat_history.push(format!("[System]: Connection authorized by @{}. Key exchange complete.", peer_name));
+                        scroll_offset = 0;
 
                         let (mut reader, mut writer) = stream.into_split();
                         tokio::spawn(async move {
@@ -470,6 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AppEvent::NetworkMessage(msg) => {
                     if let AppState::Connected { peer_name, .. } = &app_state {
                         chat_history.push(format!("[{}]: {}", peer_name, msg));
+                        scroll_offset = 0;
                     }
                 }
                 AppEvent::NetworkDisconnected => {
@@ -477,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match current_state {
                         AppState::Connected { my_name, .. } | AppState::IncomingRequest { my_name, .. } => {
                             chat_history.push("[System]: Connection closed by peer.".to_string());
+                            scroll_offset = 0;
                             app_state = AppState::Listening { my_name };
                         }
                         other => {
@@ -486,6 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 AppEvent::Error(err) => {
                     chat_history.push(format!("[Error]: {}", err));
+                    scroll_offset = 0;
                 }
             }
         }
