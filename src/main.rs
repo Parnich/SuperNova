@@ -15,6 +15,7 @@ use ratatui::{
 use std::{io, net::SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -31,20 +32,22 @@ enum AppState {
         my_name: String,
         peer_addr: SocketAddr,
         peer_name: String,
+        peer_public: [u8; 32],
         stream: tokio::net::TcpStream,
     },
     Connected {
         my_name: String,
         peer_addr: SocketAddr,
         peer_name: String,
+        shared_secret: SecureBuffer,
         tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     },
 }
 
 enum AppEvent {
     Terminal(KeyEvent),
-    NetworkIncomingAuth(tokio::net::TcpStream, SocketAddr, String),
-    HandshakeSuccess(tokio::net::TcpStream, SocketAddr, String),
+    NetworkIncomingAuth(tokio::net::TcpStream, SocketAddr, String, [u8; 32]),
+    HandshakeSuccess(tokio::net::TcpStream, SocketAddr, String, Vec<u8>),
     NetworkMessage(String),
     NetworkDisconnected,
     Error(String),
@@ -77,10 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut req_buf = [0u8; 512];
                         if stream.read_exact(&mut req_buf).await.is_ok() {
                             if req_buf[0] == 2 {
-                                let len = u16::from_be_bytes([req_buf[1], req_buf[2]]) as usize;
-                                if len <= 509 {
-                                    if let Ok(name) = String::from_utf8(req_buf[3..3+len].to_vec()) {
-                                        let _ = incoming_tx.send(AppEvent::NetworkIncomingAuth(stream, addr, name)).await;
+                                let total_len = u16::from_be_bytes([req_buf[1], req_buf[2]]) as usize;
+                                if total_len >= 32 && total_len <= 509 {
+                                    let name_len = total_len - 32;
+                                    if let Ok(name) = String::from_utf8(req_buf[3..3+name_len].to_vec()) {
+                                        let mut peer_public = [0u8; 32];
+                                        peer_public.copy_from_slice(&req_buf[3+name_len..3+name_len+32]);
+                                        let _ = incoming_tx.send(AppEvent::NetworkIncomingAuth(stream, addr, name, peer_public)).await;
                                         return;
                                     }
                                 }
@@ -133,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AppState::InputName => "Set your identity before entering the grid...".to_string(),
                 AppState::Listening { my_name } => format!("Listening on port 9099 as @{}", my_name),
                 AppState::IncomingRequest { peer_name, peer_addr, .. } => format!("Authorization request from @{} ({})", peer_name, peer_addr),
-                AppState::Connected { peer_name, peer_addr, .. } => format!("Connected with @{} ({})", peer_name, peer_addr),
+                AppState::Connected { peer_name, peer_addr, .. } => format!("Secured link with @{} ({})", peer_name, peer_addr),
             };
             let status = Paragraph::new(status_string)
                 .style(Style::default().fg(Color::Green));
@@ -194,24 +200,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                                                         match tokio::net::TcpStream::connect(addr).await {
                                                             Ok(mut stream) => {
+                                                                let my_secret = EphemeralSecret::random_from_rng(&mut rand::thread_rng());
+                                                                let my_public = PublicKey::from(&my_secret);
+
                                                                 let mut req_buf = [0u8; 512];
                                                                 req_buf[0] = 2;
                                                                 let name_bytes = my_name_clone.as_bytes();
-                                                                let len = name_bytes.len().min(509);
-                                                                let len_bytes = (len as u16).to_be_bytes();
+                                                                let name_len = name_bytes.len().min(477);
+                                                                let total_len = name_len + 32;
+                                                                let len_bytes = (total_len as u16).to_be_bytes();
                                                                 req_buf[1] = len_bytes[0];
                                                                 req_buf[2] = len_bytes[1];
-                                                                req_buf[3..3+len].copy_from_slice(&name_bytes[..len]);
-                                                                rand::thread_rng().fill_bytes(&mut req_buf[3+len..]);
+                                                                req_buf[3..3+name_len].copy_from_slice(&name_bytes[..name_len]);
+                                                                req_buf[3+name_len..3+name_len+32].copy_from_slice(my_public.as_bytes());
+                                                                rand::thread_rng().fill_bytes(&mut req_buf[3+name_len+32..]);
 
                                                                 if stream.write_all(&req_buf).await.is_ok() {
                                                                     let mut resp_buf = [0u8; 512];
                                                                     if stream.read_exact(&mut resp_buf).await.is_ok() {
                                                                         if resp_buf[0] == 3 && resp_buf[3] == 1 {
-                                                                            let p_len = u16::from_be_bytes([resp_buf[1], resp_buf[2]]) as usize;
-                                                                            if p_len > 1 && p_len <= 509 {
-                                                                                if let Ok(p_name) = String::from_utf8(resp_buf[4..3+p_len].to_vec()) {
-                                                                                    let _ = connect_tx.send(AppEvent::HandshakeSuccess(stream, addr, p_name)).await;
+                                                                            let resp_total_len = u16::from_be_bytes([resp_buf[1], resp_buf[2]]) as usize;
+                                                                            if resp_total_len >= 33 && resp_total_len <= 509 {
+                                                                                let p_name_len = resp_total_len - 1 - 32;
+                                                                                if let Ok(p_name) = String::from_utf8(resp_buf[4..4+p_name_len].to_vec()) {
+                                                                                    let mut peer_pub_bytes = [0u8; 32];
+                                                                                    peer_pub_bytes.copy_from_slice(&resp_buf[4+p_name_len..4+p_name_len+32]);
+                                                                                    let peer_public = PublicKey::from(peer_pub_bytes);
+                                                                                    let shared_secret = my_secret.diffie_hellman(&peer_public);
+                                                                                    let _ = connect_tx.send(AppEvent::HandshakeSuccess(stream, addr, p_name, shared_secret.as_bytes().to_vec())).await;
                                                                                     return;
                                                                                 }
                                                                             }
@@ -235,20 +251,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 app_state = AppState::Listening { my_name };
                                             }
                                         }
-                                        AppState::IncomingRequest { my_name, peer_addr, peer_name, mut stream } => {
+                                        AppState::IncomingRequest { my_name, peer_addr, peer_name, peer_public, mut stream } => {
                                             let answer = input_text.trim().to_lowercase();
                                             input_text.clear();
                                             if answer == "yes" {
+                                                let my_secret = EphemeralSecret::random_from_rng(&mut rand::thread_rng());
+                                                let my_public = PublicKey::from(&my_secret);
+                                                let peer_pub_obj = PublicKey::from(peer_public);
+                                                let shared_secret = my_secret.diffie_hellman(&peer_pub_obj);
+
                                                 let mut resp_buf = [0u8; 512];
                                                 resp_buf[0] = 3;
                                                 let name_bytes = my_name.as_bytes();
-                                                let len = (name_bytes.len() + 1).min(509);
-                                                let len_bytes = (len as u16).to_be_bytes();
+                                                let name_len = name_bytes.len().min(476);
+                                                let total_len = name_len + 1 + 32;
+                                                let len_bytes = (total_len as u16).to_be_bytes();
                                                 resp_buf[1] = len_bytes[0];
                                                 resp_buf[2] = len_bytes[1];
                                                 resp_buf[3] = 1;
-                                                resp_buf[4..4+name_bytes.len()].copy_from_slice(name_bytes);
-                                                rand::thread_rng().fill_bytes(&mut resp_buf[4+name_bytes.len()..]);
+                                                resp_buf[4..4+name_len].copy_from_slice(&name_bytes[..name_len]);
+                                                resp_buf[4+name_len..4+name_len+32].copy_from_slice(my_public.as_bytes());
+                                                rand::thread_rng().fill_bytes(&mut resp_buf[4+name_len+32..]);
 
                                                 if stream.write_all(&resp_buf).await.is_ok() {
                                                     let (net_send_tx, mut net_send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
@@ -260,9 +283,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         my_name: my_name.clone(),
                                                         peer_addr: p_addr,
                                                         peer_name: p_name,
+                                                        shared_secret: SecureBuffer { data: shared_secret.as_bytes().to_vec() },
                                                         tx: net_send_tx,
                                                     };
-                                                    chat_history.push("[System]: Secure channel established.".to_string());
+                                                    chat_history.push("[System]: Key exchange complete. Secure channel established.".to_string());
 
                                                     let (mut reader, mut writer) = stream.into_split();
                                                     tokio::spawn(async move {
@@ -320,11 +344,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 app_state = AppState::Listening { my_name };
                                             }
                                         }
-                                        AppState::Connected { my_name, peer_addr, peer_name, tx } => {
+                                        AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx } => {
                                             let _ = tx.send(input_text.as_bytes().to_vec()).await;
                                             chat_history.push(format!("[You]: {}", input_text));
                                             input_text.clear();
-                                            app_state = AppState::Connected { my_name, peer_addr, peer_name, tx };
+                                            app_state = AppState::Connected { my_name, peer_addr, peer_name, shared_secret, tx };
                                         }
                                     }
                                 }
@@ -333,7 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                AppEvent::NetworkIncomingAuth(stream, addr, peer_name) => {
+                AppEvent::NetworkIncomingAuth(stream, addr, peer_name, peer_public) => {
                     let current_state = std::mem::replace(&mut app_state, AppState::InputName);
                     match current_state {
                         AppState::Listening { my_name } => {
@@ -342,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 my_name,
                                 peer_addr: addr,
                                 peer_name,
+                                peer_public,
                                 stream,
                             };
                         }
@@ -357,7 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                AppEvent::HandshakeSuccess(stream, addr, peer_name) => {
+                AppEvent::HandshakeSuccess(stream, addr, peer_name, secret_bytes) => {
                     let current_state = std::mem::replace(&mut app_state, AppState::InputName);
                     if let AppState::Listening { my_name } = current_state {
                         let (net_send_tx, mut net_send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
@@ -367,9 +392,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             my_name: my_name.clone(),
                             peer_addr: addr,
                             peer_name: peer_name.clone(),
+                            shared_secret: SecureBuffer { data: secret_bytes },
                             tx: net_send_tx,
                         };
-                        chat_history.push(format!("[System]: Connection authorized by @{}.", peer_name));
+                        chat_history.push(format!("[System]: Connection authorized by @{}. Key exchange complete.", peer_name));
 
                         let (mut reader, mut writer) = stream.into_split();
                         tokio::spawn(async move {
