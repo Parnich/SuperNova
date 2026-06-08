@@ -272,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         AppState::IncomingRequest { my_name, peer_addr, peer_name, peer_public, mut stream } => {
                                             let answer = input_text.trim().to_lowercase();
                                             input_text.clear();
-                                            if answer == "yes" {
+                                            if answer == "y" || answer == "yes" {
                                                 let my_secret = EphemeralSecret::random_from_rng(&mut rand::thread_rng());
                                                 let my_public = PublicKey::from(&my_secret);
                                                 let peer_pub_obj = PublicKey::from(peer_public);

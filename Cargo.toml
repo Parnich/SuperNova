@@ -12,3 +12,4 @@ chacha20poly1305 = "0.10.1"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 rand = "0.8.5"
 futures = "0.3.32"
+libp2p = { version = "0.53", features = ["tokio", "gossipsub", "mdns", "noise", "tcp", "yamux", "macros"] }
